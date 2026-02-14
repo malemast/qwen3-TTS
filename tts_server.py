@@ -1,0 +1,256 @@
+"""
+Simple HTTP TTS Server for Qwen3-TTS.
+
+Runs on the RunPod GPU pod and serves TTS requests via HTTP.
+This is used instead of serverless for batch processing.
+"""
+
+import asyncio
+import base64
+import io
+import logging
+import os
+from contextlib import asynccontextmanager
+from typing import Optional
+
+import numpy as np
+import soundfile as sf
+import torch
+import uvicorn
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Global model instance
+_model = None
+_processor = None
+
+MODEL_ID = "Qwen/Qwen3-TTS"
+SAMPLE_RATE = 24000
+
+
+class TTSRequest(BaseModel):
+    """TTS generation request."""
+    text: str
+    reference_audio_base64: Optional[str] = None
+    reference_text: Optional[str] = None
+    language: str = "English"
+    output_format: str = "wav"  # wav or mp3
+
+
+class TTSResponse(BaseModel):
+    """TTS generation response."""
+    audio_base64: str
+    duration_seconds: float
+    sample_rate: int = SAMPLE_RATE
+
+
+class HealthResponse(BaseModel):
+    """Health check response."""
+    status: str
+    model_loaded: bool
+    gpu_available: bool
+    gpu_name: Optional[str] = None
+
+
+def load_model():
+    """Load Qwen3-TTS model."""
+    global _model, _processor
+
+    if _model is not None:
+        return
+
+    logger.info(f"Loading Qwen3-TTS model: {MODEL_ID}")
+
+    from transformers import AutoProcessor, Qwen3TTSForConditionalGeneration
+
+    _processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
+    _model = Qwen3TTSForConditionalGeneration.from_pretrained(
+        MODEL_ID,
+        torch_dtype=torch.bfloat16,
+        device_map="cuda",
+        trust_remote_code=True,
+    )
+
+    logger.info("Qwen3-TTS model loaded successfully")
+
+
+def decode_audio_base64(audio_b64: str) -> tuple[np.ndarray, int]:
+    """Decode base64 audio to numpy array."""
+    if "," in audio_b64:
+        audio_b64 = audio_b64.split(",")[1]
+
+    audio_bytes = base64.b64decode(audio_b64)
+    audio_buffer = io.BytesIO(audio_bytes)
+    audio, sr = sf.read(audio_buffer)
+
+    return audio.astype(np.float32), sr
+
+
+def encode_audio_base64(audio: np.ndarray, sample_rate: int, format: str = "wav") -> str:
+    """Encode numpy audio to base64."""
+    buffer = io.BytesIO()
+    sf.write(buffer, audio, sample_rate, format=format)
+    audio_bytes = buffer.getvalue()
+    audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+
+    mime_type = "audio/wav" if format == "wav" else "audio/mpeg"
+    return f"data:{mime_type};base64,{audio_b64}"
+
+
+def resample_audio(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
+    """Resample audio to target sample rate."""
+    if orig_sr == target_sr:
+        return audio
+
+    try:
+        import librosa
+        return librosa.resample(audio, orig_sr=orig_sr, target_sr=target_sr)
+    except ImportError:
+        ratio = target_sr / orig_sr
+        new_length = int(len(audio) * ratio)
+        indices = np.linspace(0, len(audio) - 1, new_length)
+        return np.interp(indices, np.arange(len(audio)), audio)
+
+
+def generate_speech(
+    text: str,
+    reference_audio: Optional[np.ndarray] = None,
+    reference_text: Optional[str] = None,
+    language: str = "English",
+) -> tuple[np.ndarray, float]:
+    """Generate speech from text."""
+    load_model()
+
+    if reference_audio is not None:
+        logger.info(f"Generating with voice cloning, ref: {len(reference_audio)} samples")
+        inputs = _processor(
+            text=text,
+            audio=reference_audio,
+            audio_transcript=reference_text,
+            return_tensors="pt",
+        )
+    else:
+        logger.info("Generating with default voice")
+        inputs = _processor(
+            text=text,
+            return_tensors="pt",
+        )
+
+    inputs = {k: v.to(_model.device) if hasattr(v, "to") else v for k, v in inputs.items()}
+
+    with torch.no_grad():
+        outputs = _model.generate(
+            **inputs,
+            max_new_tokens=4096,
+        )
+
+    audio = _processor.decode(outputs[0])
+    audio_np = audio.cpu().numpy().squeeze()
+
+    duration = len(audio_np) / SAMPLE_RATE
+    logger.info(f"Generated {duration:.2f}s of audio")
+
+    return audio_np, duration
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Load model on startup."""
+    logger.info("Starting TTS server...")
+    load_model()
+    yield
+    logger.info("Shutting down TTS server...")
+
+
+app = FastAPI(
+    title="Qwen3-TTS Server",
+    description="Text-to-speech with voice cloning",
+    lifespan=lifespan
+)
+
+
+@app.get("/health", response_model=HealthResponse)
+async def health_check():
+    """Health check endpoint."""
+    gpu_available = torch.cuda.is_available()
+    gpu_name = torch.cuda.get_device_name(0) if gpu_available else None
+
+    return HealthResponse(
+        status="healthy",
+        model_loaded=_model is not None,
+        gpu_available=gpu_available,
+        gpu_name=gpu_name,
+    )
+
+
+@app.post("/generate", response_model=TTSResponse)
+async def generate(request: TTSRequest):
+    """Generate speech from text."""
+    if not request.text:
+        raise HTTPException(status_code=400, detail="Text is required")
+
+    # Process reference audio if provided
+    reference_audio = None
+    if request.reference_audio_base64:
+        try:
+            audio, sr = decode_audio_base64(request.reference_audio_base64)
+            reference_audio = resample_audio(audio, sr, SAMPLE_RATE)
+            # Limit to 15 seconds
+            max_samples = 15 * SAMPLE_RATE
+            if len(reference_audio) > max_samples:
+                reference_audio = reference_audio[:max_samples]
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to decode reference audio: {str(e)}"
+            )
+
+    # Generate in thread pool to avoid blocking
+    loop = asyncio.get_event_loop()
+    try:
+        audio, duration = await loop.run_in_executor(
+            None,
+            lambda: generate_speech(
+                text=request.text,
+                reference_audio=reference_audio,
+                reference_text=request.reference_text,
+                language=request.language,
+            )
+        )
+    except Exception as e:
+        logger.error(f"TTS generation failed: {e}")
+        raise HTTPException(status_code=500, detail=f"TTS generation failed: {str(e)}")
+
+    # Encode output
+    audio_b64 = encode_audio_base64(audio, SAMPLE_RATE, format=request.output_format)
+
+    return TTSResponse(
+        audio_base64=audio_b64,
+        duration_seconds=duration,
+        sample_rate=SAMPLE_RATE,
+    )
+
+
+@app.post("/generate_and_save")
+async def generate_and_save(request: TTSRequest):
+    """Generate speech and return raw audio bytes (for large files)."""
+    result = await generate(request)
+
+    # Strip data URI prefix
+    audio_b64 = result.audio_base64
+    if "," in audio_b64:
+        audio_b64 = audio_b64.split(",")[1]
+
+    return {
+        "audio_bytes": audio_b64,
+        "duration_seconds": result.duration_seconds,
+        "sample_rate": result.sample_rate,
+    }
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
