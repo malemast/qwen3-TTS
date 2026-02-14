@@ -25,9 +25,8 @@ logger = logging.getLogger(__name__)
 
 # Global model instance
 _model = None
-_processor = None
 
-MODEL_ID = "Qwen/Qwen3-TTS"
+MODEL_ID = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
 SAMPLE_RATE = 24000
 
 
@@ -38,6 +37,8 @@ class TTSRequest(BaseModel):
     reference_text: Optional[str] = None
     language: str = "English"
     output_format: str = "wav"  # wav or mp3
+    speaker: str = "Vivian"  # Default speaker for non-cloned voice
+    style_instruction: Optional[str] = None  # e.g., "Speak warmly and naturally"
 
 
 class TTSResponse(BaseModel):
@@ -57,21 +58,19 @@ class HealthResponse(BaseModel):
 
 def load_model():
     """Load Qwen3-TTS model."""
-    global _model, _processor
+    global _model
 
     if _model is not None:
         return
 
     logger.info(f"Loading Qwen3-TTS model: {MODEL_ID}")
 
-    from transformers import AutoProcessor, Qwen3TTSForConditionalGeneration
+    from qwen_tts import Qwen3TTSModel
 
-    _processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
-    _model = Qwen3TTSForConditionalGeneration.from_pretrained(
+    _model = Qwen3TTSModel.from_pretrained(
         MODEL_ID,
-        torch_dtype=torch.bfloat16,
-        device_map="cuda",
-        trust_remote_code=True,
+        device_map="cuda:0",
+        dtype=torch.bfloat16,
     )
 
     logger.info("Qwen3-TTS model loaded successfully")
@@ -118,39 +117,43 @@ def resample_audio(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarra
 def generate_speech(
     text: str,
     reference_audio: Optional[np.ndarray] = None,
+    reference_audio_sr: int = SAMPLE_RATE,
     reference_text: Optional[str] = None,
     language: str = "English",
+    speaker: str = "Vivian",
+    style_instruction: Optional[str] = None,
 ) -> tuple[np.ndarray, float]:
     """Generate speech from text."""
     load_model()
 
-    if reference_audio is not None:
+    if reference_audio is not None and reference_text:
+        # Voice cloning mode
         logger.info(f"Generating with voice cloning, ref: {len(reference_audio)} samples")
-        inputs = _processor(
+
+        wavs, sr = _model.generate_voice_clone(
             text=text,
-            audio=reference_audio,
-            audio_transcript=reference_text,
-            return_tensors="pt",
+            language=language,
+            ref_audio=(reference_audio, reference_audio_sr),
+            ref_text=reference_text,
         )
     else:
-        logger.info("Generating with default voice")
-        inputs = _processor(
+        # Use built-in voice with optional style instruction
+        logger.info(f"Generating with speaker: {speaker}")
+
+        instruct = style_instruction or "Speak naturally and clearly"
+
+        wavs, sr = _model.generate_custom_voice(
             text=text,
-            return_tensors="pt",
+            language=language,
+            speaker=speaker,
+            instruct=instruct,
         )
 
-    inputs = {k: v.to(_model.device) if hasattr(v, "to") else v for k, v in inputs.items()}
+    audio_np = wavs[0] if isinstance(wavs, list) else wavs
+    if hasattr(audio_np, 'cpu'):
+        audio_np = audio_np.cpu().numpy()
 
-    with torch.no_grad():
-        outputs = _model.generate(
-            **inputs,
-            max_new_tokens=4096,
-        )
-
-    audio = _processor.decode(outputs[0])
-    audio_np = audio.cpu().numpy().squeeze()
-
-    duration = len(audio_np) / SAMPLE_RATE
+    duration = len(audio_np) / sr
     logger.info(f"Generated {duration:.2f}s of audio")
 
     return audio_np, duration
@@ -194,12 +197,14 @@ async def generate(request: TTSRequest):
 
     # Process reference audio if provided
     reference_audio = None
+    reference_audio_sr = SAMPLE_RATE
     if request.reference_audio_base64:
         try:
             audio, sr = decode_audio_base64(request.reference_audio_base64)
-            reference_audio = resample_audio(audio, sr, SAMPLE_RATE)
+            reference_audio = audio
+            reference_audio_sr = sr
             # Limit to 15 seconds
-            max_samples = 15 * SAMPLE_RATE
+            max_samples = 15 * sr
             if len(reference_audio) > max_samples:
                 reference_audio = reference_audio[:max_samples]
         except Exception as e:
@@ -216,8 +221,11 @@ async def generate(request: TTSRequest):
             lambda: generate_speech(
                 text=request.text,
                 reference_audio=reference_audio,
+                reference_audio_sr=reference_audio_sr,
                 reference_text=request.reference_text,
                 language=request.language,
+                speaker=request.speaker,
+                style_instruction=request.style_instruction,
             )
         )
     except Exception as e:

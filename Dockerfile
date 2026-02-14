@@ -19,12 +19,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install --no-cache-dir fastapi uvicorn
 
 # Pre-download the model during build (reduces startup time)
-RUN python -c "from transformers import AutoProcessor; \
-    AutoProcessor.from_pretrained('Qwen/Qwen3-TTS', trust_remote_code=True); \
-    print('Processor downloaded')"
-
-RUN python -c "from transformers import Qwen3TTSForConditionalGeneration; \
-    Qwen3TTSForConditionalGeneration.from_pretrained('Qwen/Qwen3-TTS', trust_remote_code=True); \
+# Using 0.6B CustomVoice model for voice cloning
+RUN python -c "from qwen_tts import Qwen3TTSModel; \
+    Qwen3TTSModel.from_pretrained('Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice'); \
     print('Model downloaded')"
 
 # Copy server code

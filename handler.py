@@ -3,7 +3,7 @@ RunPod Serverless Handler for Qwen3-TTS.
 
 Supports:
 - Text-to-speech with voice cloning from reference audio
-- Natural language emotion tags (Qwen3's strength)
+- Natural language style instructions
 - Base64 audio input/output for voice samples
 """
 
@@ -11,9 +11,7 @@ import runpod
 import base64
 import io
 import logging
-import tempfile
 import os
-from pathlib import Path
 
 import torch
 import numpy as np
@@ -24,29 +22,26 @@ logger = logging.getLogger(__name__)
 
 # Global model instance (loaded once at worker startup)
 _model = None
-_processor = None
 
-MODEL_ID = "Qwen/Qwen3-TTS"
+MODEL_ID = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
 SAMPLE_RATE = 24000
 
 
 def load_model():
     """Load Qwen3-TTS model on startup."""
-    global _model, _processor
+    global _model
 
     if _model is not None:
         return
 
     logger.info(f"Loading Qwen3-TTS model: {MODEL_ID}")
 
-    from transformers import AutoProcessor, Qwen3TTSForConditionalGeneration
+    from qwen_tts import Qwen3TTSModel
 
-    _processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
-    _model = Qwen3TTSForConditionalGeneration.from_pretrained(
+    _model = Qwen3TTSModel.from_pretrained(
         MODEL_ID,
-        torch_dtype=torch.bfloat16,
-        device_map="cuda",
-        trust_remote_code=True,
+        device_map="cuda:0",
+        dtype=torch.bfloat16,
     )
 
     logger.info("Qwen3-TTS model loaded successfully")
@@ -76,77 +71,60 @@ def encode_audio_base64(audio: np.ndarray, sample_rate: int, format: str = "wav"
     return f"data:{mime_type};base64,{audio_b64}"
 
 
-def resample_audio(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
-    """Resample audio to target sample rate."""
-    if orig_sr == target_sr:
-        return audio
-
-    try:
-        import librosa
-        return librosa.resample(audio, orig_sr=orig_sr, target_sr=target_sr)
-    except ImportError:
-        # Simple resampling fallback
-        ratio = target_sr / orig_sr
-        new_length = int(len(audio) * ratio)
-        indices = np.linspace(0, len(audio) - 1, new_length)
-        return np.interp(indices, np.arange(len(audio)), audio)
-
-
 def generate_speech(
     text: str,
     reference_audio: np.ndarray | None = None,
+    reference_audio_sr: int = SAMPLE_RATE,
     reference_text: str | None = None,
     language: str = "English",
+    speaker: str = "Vivian",
+    style_instruction: str | None = None,
 ) -> tuple[np.ndarray, float]:
     """
     Generate speech from text using Qwen3-TTS.
 
     Args:
-        text: Text to synthesize (can include emotion tags like [happy], [sad])
-        reference_audio: Optional reference audio for voice cloning (24kHz)
-        reference_text: Transcript of reference audio (improves cloning quality)
+        text: Text to synthesize
+        reference_audio: Optional reference audio for voice cloning
+        reference_audio_sr: Sample rate of reference audio
+        reference_text: Transcript of reference audio (required for cloning)
         language: Language for synthesis
+        speaker: Built-in speaker name (if not cloning)
+        style_instruction: Natural language style instruction
 
     Returns:
         Tuple of (audio_array, duration_seconds)
     """
     load_model()
 
-    # Build the prompt
-    if reference_audio is not None:
+    if reference_audio is not None and reference_text:
         # Voice cloning mode
         logger.info(f"Generating with voice cloning, ref audio: {len(reference_audio)} samples")
 
-        # Qwen3-TTS expects reference audio and optional transcript
-        inputs = _processor(
+        wavs, sr = _model.generate_voice_clone(
             text=text,
-            audio=reference_audio,
-            audio_transcript=reference_text,
-            return_tensors="pt",
+            language=language,
+            ref_audio=(reference_audio, reference_audio_sr),
+            ref_text=reference_text,
         )
     else:
-        # Default voice mode
-        logger.info("Generating with default voice")
-        inputs = _processor(
+        # Use built-in voice
+        logger.info(f"Generating with speaker: {speaker}")
+
+        instruct = style_instruction or "Speak naturally and clearly"
+
+        wavs, sr = _model.generate_custom_voice(
             text=text,
-            return_tensors="pt",
+            language=language,
+            speaker=speaker,
+            instruct=instruct,
         )
 
-    # Move to GPU
-    inputs = {k: v.to(_model.device) if hasattr(v, "to") else v for k, v in inputs.items()}
+    audio_np = wavs[0] if isinstance(wavs, list) else wavs
+    if hasattr(audio_np, 'cpu'):
+        audio_np = audio_np.cpu().numpy()
 
-    # Generate
-    with torch.no_grad():
-        outputs = _model.generate(
-            **inputs,
-            max_new_tokens=4096,
-        )
-
-    # Decode audio
-    audio = _processor.decode(outputs[0])
-    audio_np = audio.cpu().numpy().squeeze()
-
-    duration = len(audio_np) / SAMPLE_RATE
+    duration = len(audio_np) / sr
     logger.info(f"Generated {duration:.2f}s of audio")
 
     return audio_np, duration
@@ -160,8 +138,10 @@ def handler(job):
     {
         "text": "Hello, how are you?",
         "reference_audio_base64": "data:audio/wav;base64,...",  # Optional
-        "reference_text": "This is me speaking.",               # Optional
+        "reference_text": "This is me speaking.",               # Required if using reference_audio
         "language": "English",                                  # Optional
+        "speaker": "Vivian",                                    # Optional (if not cloning)
+        "style_instruction": "Speak warmly",                    # Optional
         "output_format": "wav"                                  # Optional: wav or mp3
     }
 
@@ -182,22 +162,27 @@ def handler(job):
     reference_audio_b64 = job_input.get("reference_audio_base64")
     reference_text = job_input.get("reference_text")
     language = job_input.get("language", "English")
+    speaker = job_input.get("speaker", "Vivian")
+    style_instruction = job_input.get("style_instruction")
     output_format = job_input.get("output_format", "wav")
 
     logger.info(f"Processing TTS request: {len(text)} chars, format={output_format}")
 
     # Process reference audio if provided
     reference_audio = None
+    reference_audio_sr = SAMPLE_RATE
     if reference_audio_b64:
+        if not reference_text:
+            return {"error": "reference_text is required when using reference_audio_base64"}
         try:
             audio, sr = decode_audio_base64(reference_audio_b64)
-            # Resample to 24kHz if needed
-            reference_audio = resample_audio(audio, sr, SAMPLE_RATE)
+            reference_audio = audio
+            reference_audio_sr = sr
             # Limit to 15 seconds
-            max_samples = 15 * SAMPLE_RATE
+            max_samples = 15 * sr
             if len(reference_audio) > max_samples:
                 reference_audio = reference_audio[:max_samples]
-            logger.info(f"Reference audio: {len(reference_audio)/SAMPLE_RATE:.2f}s")
+            logger.info(f"Reference audio: {len(reference_audio)/sr:.2f}s")
         except Exception as e:
             logger.error(f"Failed to decode reference audio: {e}")
             return {"error": f"Failed to decode reference audio: {str(e)}"}
@@ -207,8 +192,11 @@ def handler(job):
         audio, duration = generate_speech(
             text=text,
             reference_audio=reference_audio,
+            reference_audio_sr=reference_audio_sr,
             reference_text=reference_text,
             language=language,
+            speaker=speaker,
+            style_instruction=style_instruction,
         )
     except Exception as e:
         logger.error(f"TTS generation failed: {e}")
