@@ -15,9 +15,6 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install FastAPI and uvicorn for HTTP server
-RUN pip install --no-cache-dir fastapi uvicorn
-
 # Pre-download the model during build (reduces startup time)
 # Using 0.6B CustomVoice model for voice cloning
 RUN python -c "from qwen_tts import Qwen3TTSModel; \
