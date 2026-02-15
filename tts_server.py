@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # Global model instance
 _model = None
 
-MODEL_ID = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+MODEL_ID = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
 SAMPLE_RATE = 24000
 
 
