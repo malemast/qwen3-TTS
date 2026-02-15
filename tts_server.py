@@ -128,16 +128,20 @@ def generate_speech(
     """Generate speech from text."""
     load_model()
 
-    if reference_audio is not None and reference_text:
-        # Voice cloning mode
+    if reference_audio is not None:
+        # Voice cloning mode - transcript is optional
         logger.info(f"Generating with voice cloning, ref: {len(reference_audio)} samples")
 
-        wavs, sr = _model.generate_voice_clone(
-            text=text,
-            language=language,
-            ref_audio=(reference_audio, reference_audio_sr),
-            ref_text=reference_text,
-        )
+        clone_kwargs = {
+            "text": text,
+            "language": language,
+            "ref_audio": (reference_audio, reference_audio_sr),
+        }
+        # Only include ref_text if provided
+        if reference_text:
+            clone_kwargs["ref_text"] = reference_text
+
+        wavs, sr = _model.generate_voice_clone(**clone_kwargs)
     else:
         # Use built-in voice with optional style instruction
         logger.info(f"Generating with speaker: {speaker}")
