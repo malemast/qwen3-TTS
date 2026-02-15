@@ -18,6 +18,7 @@ import soundfile as sf
 import torch
 import uvicorn
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO)
@@ -173,6 +174,15 @@ app = FastAPI(
     title="Qwen3-TTS Server",
     description="Text-to-speech with voice cloning",
     lifespan=lifespan
+)
+
+# Enable CORS for browser-based testing
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
