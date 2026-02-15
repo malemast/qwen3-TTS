@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 # Global model instance
 _model = None
 
-MODEL_ID = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
+MODEL_ID = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
 SAMPLE_RATE = 24000
 
 
@@ -39,6 +39,7 @@ class TTSRequest(BaseModel):
     output_format: str = "wav"  # wav or mp3
     speaker: str = "Vivian"  # Default speaker for non-cloned voice
     style_instruction: Optional[str] = None  # e.g., "Speak warmly and naturally"
+    pitch_shift: float = 0.0  # Semitones to shift pitch (-2 = deeper, +2 = higher)
 
 
 class TTSResponse(BaseModel):
@@ -231,6 +232,19 @@ async def generate(request: TTSRequest):
     except Exception as e:
         logger.error(f"TTS generation failed: {e}")
         raise HTTPException(status_code=500, detail=f"TTS generation failed: {str(e)}")
+
+    # Apply pitch shift if requested (negative = deeper, positive = higher)
+    if request.pitch_shift != 0.0:
+        try:
+            import librosa
+            logger.info(f"Applying pitch shift: {request.pitch_shift} semitones")
+            audio = librosa.effects.pitch_shift(
+                audio,
+                sr=SAMPLE_RATE,
+                n_steps=request.pitch_shift
+            )
+        except Exception as e:
+            logger.warning(f"Pitch shift failed: {e}")
 
     # Encode output
     audio_b64 = encode_audio_base64(audio, SAMPLE_RATE, format=request.output_format)
