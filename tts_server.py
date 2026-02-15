@@ -41,6 +41,7 @@ class TTSRequest(BaseModel):
     speaker: str = "Vivian"  # Default speaker for non-cloned voice
     style_instruction: Optional[str] = None  # e.g., "Speak warmly and naturally"
     pitch_shift: float = 0.0  # Semitones to shift pitch (-2 = deeper, +2 = higher)
+    x_vector_only: bool = True  # If True, use x-vector mode (no transcript needed). If False, use ICL mode (needs transcript)
 
 
 class TTSResponse(BaseModel):
@@ -124,20 +125,23 @@ def generate_speech(
     language: str = "English",
     speaker: str = "Vivian",
     style_instruction: Optional[str] = None,
+    x_vector_only: bool = True,
 ) -> tuple[np.ndarray, float]:
     """Generate speech from text."""
     load_model()
 
     if reference_audio is not None:
-        # Voice cloning mode - transcript is optional
-        logger.info(f"Generating with voice cloning, ref: {len(reference_audio)} samples")
+        # Voice cloning mode
+        mode = "x-vector" if x_vector_only else "ICL"
+        logger.info(f"Generating with voice cloning ({mode} mode), ref: {len(reference_audio)} samples")
 
         clone_kwargs = {
             "text": text,
             "language": language,
             "ref_audio": (reference_audio, reference_audio_sr),
+            "x_vector_only_mode": x_vector_only,
         }
-        # Only include ref_text if provided
+        # Only include ref_text if provided (required for ICL mode)
         if reference_text:
             clone_kwargs["ref_text"] = reference_text
 
@@ -241,6 +245,7 @@ async def generate(request: TTSRequest):
                 language=request.language,
                 speaker=request.speaker,
                 style_instruction=request.style_instruction,
+                x_vector_only=request.x_vector_only,
             )
         )
     except Exception as e:
